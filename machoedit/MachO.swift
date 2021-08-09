@@ -10,7 +10,6 @@ extension MachO {
             
             self.data = data
 
-            let header = machheader
             var offset = MemoryLayout<mach_header_64>.size
             var loadCommands: [LoadCommand] = []
             for _ in 0..<Int(header.ncmds) {
@@ -22,7 +21,7 @@ extension MachO {
             self.loadCommands = loadCommands
         }
         
-        var machheader: mach_header_64 {
+        var header: mach_header_64 {
             load(fromByteOffset: 0, as: mach_header_64.self)
         }
 
@@ -115,6 +114,15 @@ extension MachO.File {
             case .segment64:
                 return try SegmentCommand64(atByteOffset: offset, in: self)
                 
+            case .symtab:
+                return try SymbolTable(atByteOffset: offset, in: self)
+
+            case .dysymtab:
+                return try DynamicSymbolTable(atByteOffset: offset, in: self)
+
+            case .dyldInfo, .dyldInfoOnly:
+                return try DyldInfo(atByteOffset: offset, in: self)
+
             default:
                 return UnknownLoadCommand(type: commandType, data: data[offset..<offset+commandSize])
             }
@@ -132,4 +140,100 @@ extension String {
     }
 }
 
+extension mach_header_64 : CustomStringConvertible {
+    public var description: String {
+        "magic: 0x\(String(magic, radix: 16)) \(cpuDescription) \(fileTypeDescription) flags: 0x\(String(flags, radix: 16))"
+    }
+    
+    private var cpuDescription: String {
+        switch (cputype, cpusubtype) {
+        case (CPU_TYPE_X86_64, _): return "Intel X86 64 bit"
+        default: return "Unsupported cpu type"
+        }
+    }
+    
+    private var fileTypeDescription: String {
+        switch Int32(filetype) {
+        case MH_OBJECT: return "relocatable object file"
+        case MH_EXECUTE: return "demand paged executable file"
+        case MH_FVMLIB: return "fixed VM shared library file"
+        case MH_CORE: return "core file"
+        case MH_PRELOAD: return "preloaded executable file"
+        case MH_DYLIB: return "dynamically bound shared library"
+        case MH_DYLINKER: return "dynamic link editor"
+        case MH_BUNDLE: return "dynamically bound bundle file"
+        case MH_DYLIB_STUB: return "shared library stub" // for static linking only, no section contents
 
+        case MH_DSYM: return "companion file with only debug sections"
+
+        case MH_KEXT_BUNDLE: return "x86_64 kexts"
+        case MH_FILESET: return "mach-o file set"   // a file composed of other Mach-Os to
+                                                    // be run in the same userspace sharing
+                                                    // a single linkedit.
+        
+        default: return "\(filetype)"
+        }
+    }
+}
+
+extension MachO {
+    struct Contents {
+        // the load command
+        var header: Data
+        
+        // the data and the offset at whcih it is to be placed in the file
+        var data: (data: Data, offset: Int)? = nil
+    
+        init(header: Data, data: Data? = nil, offset: Int? = nil) {
+            self.header = header
+            if let data = data, let offset = offset {
+                self.data = (data: data, offset: offset)
+            }
+        }
+    }
+    
+}
+
+protocol MachOWritable {
+    var headerSize: Int { get }
+    func contents(atOffset offset: Int) -> MachO.Contents
+}
+
+extension MachO.File {
+    func write(to path: String) throws {
+        var headerData = Data()
+        var contentsData = Data()
+        let commandsSize = loadCommands.reduce(0, {$0 + $1.headerSize })
+        var offset = 0 //MemoryLayout<mach_header_64>.size + commandsSize
+        for command in loadCommands {
+            print("Command \(command.type)")
+            let contents = command.contents(atOffset: offset)
+            headerData += contents.header
+            if let (data, dataOffset) = contents.data {
+                if dataOffset == contentsData.count {
+                    contentsData += data
+                    offset += data.count
+                }
+                else if dataOffset + data.count <= contentsData.count {
+                    // load commands may place their content in a previous segment, e.g.
+                    // the linkedit segment makes room for the dyldInfo, symtab, and dysymtab commands
+                    contentsData[dataOffset..<dataOffset + data.count] = data
+                }
+                else {
+                    fatalError("We hit an unforeseen case.")
+                }
+            }
+        }
+
+        var header = header
+        header.ncmds = UInt32(loadCommands.count)
+        header.sizeofcmds = UInt32(headerData.count)
+        
+        let machHeader = withUnsafePointer(to: &header) { ptr in
+            Data(bytes: ptr, count: MemoryLayout<mach_header_64>.size)
+        }
+        
+        contentsData[0..<(machHeader.count + headerData.count)] = machHeader + headerData
+        try contentsData.write(to: URL(fileURLWithPath: path))
+    }
+}
