@@ -122,6 +122,21 @@ extension MachO.File {
 
             case .dyldInfo, .dyldInfoOnly:
                 return try DyldInfo(atByteOffset: offset, in: self)
+//                LC_CODE_SIGNATURE, LC_SEGMENT_SPLIT_INFO,
+//                               LC_FUNCTION_STARTS, LC_DATA_IN_CODE,
+//                               LC_DYLIB_CODE_SIGN_DRS,
+//                               LC_LINKER_OPTIMIZATION_HINT,
+//                               LC_DYLD_EXPORTS_TRIE, or
+//                               LC_DYLD_CHAINED_FIXUPS
+            case .codeSignature,
+                    .segmentSplitInfo,
+                    .functionStarts,
+                    .dataInCode,
+                    .dylibCodeSignDRs,
+                    .linkerOptimizationHint,
+                    .dyldExportsTrie,
+                    .dyldChainedFixups:
+                return try LinkEditData(atByteOffset: offset, in: self)
 
             default:
                 return UnknownLoadCommand(type: commandType, data: data[offset..<offset+commandSize])

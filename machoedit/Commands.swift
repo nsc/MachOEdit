@@ -83,7 +83,7 @@ struct SegmentCommand64 : LoadCommand {
         
         var sectionsHeader = Data()
         var segmentData = Data(repeating: 0, count: Int(command.filesize))
-        var offset = offset
+//        var offset = offset
         for section in sections {
             let contents = section.contents(atOffset: offset)
             sectionsHeader += contents.header
@@ -243,11 +243,11 @@ struct DyldInfo : LoadCommand {
             contentsData += data
         }
 
-        let data = withUnsafePointer(to: &newCommand) { ptr in
+        let header = withUnsafePointer(to: &newCommand) { ptr in
             Data(bytes: ptr, count: MemoryLayout<dyld_info_command>.size)
         }
         
-        return MachO.Contents(header: data, data: contentsData, offset: contentsOffset ?? offset)
+        return MachO.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)
     }
 }
 
@@ -297,13 +297,13 @@ struct SymbolTable : LoadCommand {
         //                       nsyms: UInt32(numberOfSymbols),
         //                       stroff: UInt32(offset + numberOfSymbols),
         //                       strsize: UInt32(stringData.count))
-        let data = withUnsafePointer(to: &newCommand) { ptr in
+        let header = withUnsafePointer(to: &newCommand) { ptr in
             Data(bytes: ptr, count: MemoryLayout<symtab_command>.size)
         }
         
         let paddingSize = Int(newCommand.stroff) - Int(newCommand.symoff) - Int(newCommand.nsyms) * MemoryLayout<nlist_64>.size
         var padding = Data(repeating: 0, count: paddingSize)
-        return MachO.Contents(header: data, data: symbolData + padding + stringData, offset: Int(newCommand.symoff))
+        return MachO.Contents(header: header, data: symbolData + padding + stringData, offset: Int(newCommand.symoff))
     }
 }
 
@@ -455,14 +455,54 @@ struct DynamicSymbolTable : LoadCommand {
             contentsData += data
         }
 
-        let data = withUnsafePointer(to: &newCommand) { ptr in
+        let header = withUnsafePointer(to: &newCommand) { ptr in
             Data(bytes: ptr, count: MemoryLayout<dysymtab_command>.size)
         }
         
-        return MachO.Contents(header: data, data: contentsData, offset: contentsOffset ?? offset)
+        return MachO.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)
     }
 }
 
+struct LinkEditData : LoadCommand {
+    var type: MachO.LoadCommandType {
+        MachO.LoadCommandType(rawValue: UInt(command.cmd))!
+    }
+    
+    var headerSize: Int {
+        MemoryLayout<linkedit_data_command>.size
+    }
+    
+    init(atByteOffset offset: Int, in file: MachO.File) throws {
+        command = file.load(fromByteOffset: offset, as: linkedit_data_command.self)
+        if command.datasize != 0 {
+            data = file.data[command.dataoff..<command.dataoff + command.datasize]
+        }
+    }
+    
+    func contents(atOffset offset: Int) -> MachO.Contents {
+        var newCommand = command
+        
+        var contentsData: Data?
+        var contentsOffset: Int?
+        if let data = data {
+            if contentsOffset == nil {
+                contentsOffset = Int(newCommand.dataoff)
+            }
+            
+            contentsData = data
+        }
+        
+        let header = withUnsafePointer(to: &newCommand) { ptr in
+            Data(bytes: ptr, count: MemoryLayout<linkedit_data_command>.size)
+        }
+
+        
+        return MachO.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)
+    }
+    
+    var command: linkedit_data_command
+    var data: Data? = nil
+}
 //extension DynamicSymbolTable : CustomStringConvertible {
 //    var description: String {
 //
