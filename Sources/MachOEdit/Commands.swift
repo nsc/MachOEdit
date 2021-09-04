@@ -1,13 +1,17 @@
 import Foundation
 
 protocol LoadCommand : CustomStringConvertible, MachOWritable {
-    var type: MachO.LoadCommandType { get }
+    var type: LoadCommandType { get }
 }
 
 extension LoadCommand {
     var description: String {
         "\(self.type)"
     }
+}
+
+protocol LoadCommandWithFileContents : LoadCommand {
+    var dataFileOffset: UInt64 { get set }
 }
 
 extension load_command {
@@ -21,12 +25,12 @@ extension load_command {
 }
 
 struct UnknownLoadCommand : LoadCommand {
-    var type: MachO.LoadCommandType
+    var type: LoadCommandType
     var data: Data
     
     var headerSize: Int { data.count }
-    func contents(atOffset offset: Int) -> MachO.Contents {
-        MachO.Contents(header: data, data: nil)
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
+        [MachOFile.Contents(header: data, data: nil)]
     }
 }
 
@@ -37,10 +41,47 @@ struct SegmentCommand64 : LoadCommand {
 
     var sections: [Section64]
     
-    var type: MachO.LoadCommandType { .segment64 }
-    var command: segment_command_64
+    var type: LoadCommandType { .segment64 }
+    var vmaddr: UInt64 {
+        get { command.vmaddr }
+        set { command.vmaddr = newValue }
+    }
     
-    init(atByteOffset offset: Int, in file: MachO.File) throws {
+    var vmsize: UInt64 {
+        get { command.vmsize }
+        set { command.vmsize = newValue }
+    }
+    
+    var fileOffset: UInt64 {
+        get { command.fileoff }
+        set {
+            command.fileoff = newValue
+        }
+    }
+    
+    var filesize: UInt64 {
+        get { command.filesize }
+        set { command.filesize = newValue }
+    }
+    
+    var maxprot: vm_prot_t {
+        get { command.maxprot }
+        set { command.maxprot = newValue }
+    }
+    
+    var initprot: vm_prot_t {
+        get { command.initprot }
+        set { command.initprot = newValue }
+    }
+    
+    var flags: UInt32 {
+        get { command.flags }
+        set { command.flags = newValue }
+    }
+
+    private var command: segment_command_64
+    
+    init(atByteOffset offset: Int, in file: MachOFile) throws {
         let command = file.load(fromByteOffset: offset, as: segment_command_64.self)
         var offset = offset + MemoryLayout<segment_command_64>.size
         
@@ -68,7 +109,7 @@ struct SegmentCommand64 : LoadCommand {
         sections.reduce(MemoryLayout<segment_command_64>.size) { $0 + $1.headerSize }
     }
 
-    func contents(atOffset offset: Int) -> MachO.Contents {
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
         var newCommand = segment_command_64(cmd: UInt32(LC_SEGMENT_64),
                                             cmdsize: UInt32(headerSize),
                                             segname: command.segname,
@@ -81,18 +122,8 @@ struct SegmentCommand64 : LoadCommand {
                                             nsects: UInt32(sections.count),
                                             flags: command.flags)
         
-        var sectionsHeader = Data()
-        var segmentData = Data(repeating: 0, count: Int(command.filesize))
-//        var offset = offset
-        for section in sections {
-            let contents = section.contents(atOffset: offset)
-            sectionsHeader += contents.header
-            if let (data, dataOffset) = contents.data {
-                let lower = dataOffset - offset
-                let upper = lower + data.count
-                segmentData[lower..<upper] = data
-//                offset += data.count
-            }
+        let contents = sections.flatMap { section in
+            section.contents(atOffset: offset)
         }
         
 //        newCommand.filesize = UInt64(sectionsData.count)
@@ -103,7 +134,50 @@ struct SegmentCommand64 : LoadCommand {
             Data(bytes: ptr, count: MemoryLayout<segment_command_64>.size)
         }
         
-        return MachO.Contents(header: segmentHeader + sectionsHeader , data: segmentData, offset: Int(command.fileoff))
+        let emptySegment = Data(repeating: 0, count: Int(command.filesize))
+//        return MachOFile.Contents(header: segmentHeader + sectionsHeader , data: segmentData, offset: Int(command.fileoff))
+        return [MachOFile.Contents(header: segmentHeader, data: emptySegment, offset: Int(command.fileoff))] + contents
+    }
+    
+    mutating func resizeSection(at index: Int, to size: UInt64) throws {
+        guard index >= 0 && index < sections.count else {
+            throw Error.sectionOutOfRange(index)
+        }
+        
+        let section = sections[index]
+        if section.size < size {
+            let offset = size - section.size
+            command.vmsize += offset
+            command.vmsize = (command.vmsize + 0xfff) & ~0xfff // align to 4k boundary
+            command.filesize += offset
+
+            let lowerBound = section.addr
+            var upperBound = section.addr + section.size
+            for i in 0..<sections.count {
+                var current = sections[i]
+                if (lowerBound..<upperBound).contains(current.addr) {
+                    current.addr += offset
+                    current.addr.align(to: UInt64(current.align))
+                    
+                    upperBound = current.addr + current.size
+                }
+            }
+        }
+    }
+}
+
+extension SegmentCommand64 : LoadCommandWithFileContents {
+    var dataFileOffset: UInt64 {
+        get { fileOffset }
+        set { fileOffset = newValue}
+    }
+}
+
+extension UInt64 {
+    mutating func align(to alignment: UInt64) {
+        guard alignment > 1 else { return }
+        
+        self = (self + (alignment - 1)) & ~(alignment - 1)
     }
 }
 
@@ -116,8 +190,38 @@ struct Section64 : CustomStringConvertible, MachOWritable {
         String(section.segname)
     }
 
-    var section: section_64
-    var data: Data?
+    private var section: section_64
+    var data: Data? {
+        didSet {
+            if let data = data {
+                section.size = UInt64(data.count)
+            }
+        }
+    }
+    
+    /* memory address of this section */
+    public var addr: UInt64 {
+        get { section.addr }
+        set { section.addr = newValue }
+    }
+
+    /* size in bytes of this section */
+    public var size: UInt64 {
+        get { section.size }
+        set { section.size = newValue }
+    }
+
+    /* file offset of this section */
+    public var offset: UInt32 {
+        get { section.offset }
+        set { section.offset = newValue }
+    }
+
+    /* section alignment (power of 2) */
+    public var align: UInt32 {
+        get { section.align }
+        set { section.align = newValue }
+    }
     
     var description: String {
         "section \(segmentName), \(sectionName) (size: \(data?.count ?? 0))"
@@ -128,7 +232,7 @@ struct Section64 : CustomStringConvertible, MachOWritable {
         self.data = data
     }
     
-    init(atByteOffset offset: Int, in file: MachO.File) throws {
+    init(atByteOffset offset: Int, in file: MachOFile) throws {
         self.section = file.load(fromByteOffset: offset, as: section_64.self)
         let lower = Int(section.offset)
         let upper = lower + Int(section.size)
@@ -139,7 +243,7 @@ struct Section64 : CustomStringConvertible, MachOWritable {
         MemoryLayout<section_64>.size
     }
     
-    func contents(atOffset offset: Int) -> MachO.Contents {
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
         var newSection = section
 //        newSection.offset = UInt32(offset)
         newSection.size = UInt64(data?.count ?? 0)
@@ -148,12 +252,12 @@ struct Section64 : CustomStringConvertible, MachOWritable {
             Data(bytes: ptr, count: MemoryLayout<section_64>.size)
         }
 
-        return MachO.Contents(header: header, data: data, offset: Int(newSection.offset))
+        return [MachOFile.Contents(header: header, data: data, offset: Int(newSection.offset))]
     }
 }
 
 struct DyldInfo : LoadCommand {
-    var type: MachO.LoadCommandType { command.cmd == UInt32(LC_DYLD_INFO) ? .dyldInfo : .dyldInfoOnly }
+    var type: LoadCommandType { command.cmd == UInt32(LC_DYLD_INFO) ? .dyldInfo : .dyldInfoOnly }
     var command: dyld_info_command
 
     var rebaseData: Data?
@@ -162,7 +266,7 @@ struct DyldInfo : LoadCommand {
     var lazyBindingInfoData: Data?
     var exportedSymbolsData: Data?
 
-    init(atByteOffset offset: Int, in file: MachO.File) throws {
+    init(atByteOffset offset: Int, in file: MachOFile) throws {
         self.command = file.load(fromByteOffset: offset, as: dyld_info_command.self)
 
         let rebaseDataStart             = Int(command.rebase_off)
@@ -190,7 +294,7 @@ struct DyldInfo : LoadCommand {
         MemoryLayout<dyld_info_command>.size
     }
     
-    func contents(atOffset offset: Int) -> MachO.Contents {
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
         var newCommand = command
         var contentsData = Data()
         var contentsOffset: Int? = nil
@@ -247,12 +351,12 @@ struct DyldInfo : LoadCommand {
             Data(bytes: ptr, count: MemoryLayout<dyld_info_command>.size)
         }
         
-        return MachO.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)
+        return [MachOFile.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)]
     }
 }
 
 struct SymbolTable : LoadCommand {
-    var type: MachO.LoadCommandType { .symtab }
+    var type: LoadCommandType { .symtab }
     var command: symtab_command
     
 //    enum SymbolType {
@@ -269,7 +373,7 @@ struct SymbolTable : LoadCommand {
 //    var symbols: [Symbol]
 //    var strings: [String]
     
-    init(atByteOffset offset: Int, in file: MachO.File) throws {
+    init(atByteOffset offset: Int, in file: MachOFile) throws {
         self.command = file.load(fromByteOffset: offset, as: symtab_command.self)
 
         let symbolsStart = Int(command.symoff)
@@ -288,7 +392,7 @@ struct SymbolTable : LoadCommand {
         MemoryLayout<symtab_command>.size
     }
     
-    func contents(atOffset offset: Int) -> MachO.Contents {
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
         var newCommand = command
         //        let numberOfSymbols = symbolData.count / MemoryLayout<nlist_64>.size
         //        symtab_command(cmd: command.cmd,
@@ -302,8 +406,8 @@ struct SymbolTable : LoadCommand {
         }
         
         let paddingSize = Int(newCommand.stroff) - Int(newCommand.symoff) - Int(newCommand.nsyms) * MemoryLayout<nlist_64>.size
-        var padding = Data(repeating: 0, count: paddingSize)
-        return MachO.Contents(header: header, data: symbolData + padding + stringData, offset: Int(newCommand.symoff))
+        let padding = Data(repeating: 0, count: paddingSize)
+        return [MachOFile.Contents(header: header, data: symbolData + padding + stringData, offset: Int(newCommand.symoff))]
     }
 }
 
@@ -320,7 +424,7 @@ extension SymbolTable : CustomStringConvertible {
 }
 
 struct DynamicSymbolTable : LoadCommand {
-    var type: MachO.LoadCommandType { .dysymtab }
+    var type: LoadCommandType { .dysymtab }
     
     var command: dysymtab_command
 
@@ -331,7 +435,7 @@ struct DynamicSymbolTable : LoadCommand {
     var externalRelocationsData: Data?
     var localRelocationsData: Data?
 
-    init(atByteOffset offset: Int, in file: MachO.File) throws {
+    init(atByteOffset offset: Int, in file: MachOFile) throws {
         self.command                        = file.load(fromByteOffset: offset, as: dysymtab_command.self)
 
         let tableOfContentsStart            = Int(command.tocoff)
@@ -363,7 +467,7 @@ struct DynamicSymbolTable : LoadCommand {
         MemoryLayout<dysymtab_command>.size
     }
     
-    func contents(atOffset offset: Int) -> MachO.Contents {
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
         var newCommand = command
         //        dysymtab_command(cmd: command.cmd,
         //                         cmdsize: UInt32(MemoryLayout<dysymtab_command>.size),
@@ -459,27 +563,27 @@ struct DynamicSymbolTable : LoadCommand {
             Data(bytes: ptr, count: MemoryLayout<dysymtab_command>.size)
         }
         
-        return MachO.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)
+        return [MachOFile.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)]
     }
 }
 
 struct LinkEditData : LoadCommand {
-    var type: MachO.LoadCommandType {
-        MachO.LoadCommandType(rawValue: UInt(command.cmd))!
+    var type: LoadCommandType {
+        LoadCommandType(rawValue: UInt(command.cmd))!
     }
     
     var headerSize: Int {
         MemoryLayout<linkedit_data_command>.size
     }
     
-    init(atByteOffset offset: Int, in file: MachO.File) throws {
+    init(atByteOffset offset: Int, in file: MachOFile) throws {
         command = file.load(fromByteOffset: offset, as: linkedit_data_command.self)
         if command.datasize != 0 {
             data = file.data[command.dataoff..<command.dataoff + command.datasize]
         }
     }
     
-    func contents(atOffset offset: Int) -> MachO.Contents {
+    func contents(atOffset offset: Int) -> [MachOFile.Contents] {
         var newCommand = command
         
         var contentsData: Data?
@@ -497,7 +601,7 @@ struct LinkEditData : LoadCommand {
         }
 
         
-        return MachO.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)
+        return [MachOFile.Contents(header: header, data: contentsData, offset: contentsOffset ?? offset)]
     }
     
     var command: linkedit_data_command
@@ -508,3 +612,7 @@ struct LinkEditData : LoadCommand {
 //
 //    }
 //}
+
+enum Error : Swift.Error {
+    case sectionOutOfRange(Int)
+}
